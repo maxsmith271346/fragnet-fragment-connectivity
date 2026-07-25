@@ -1,0 +1,87 @@
+schema_version: 1
+description: Readable single-run example for ringsedbs_overlap.
+expected_runs: 1
+seeds:
+- 23
+hprc:
+  source_slurm_settings:
+    experiments_per_job: 4
+    max_simultaneous_jobs: 4
+    sbatch_options:
+      gres: gpu:1
+      cpus-per-task: 4
+      partition: gpu
+  modules:
+  - GCCcore/12.2.0
+  - Python/3.10.8
+  - Anaconda3
+  conda_environment: fragNet
+  default_project_directory: ${SCRATCH}/fragnet-fragment-connectivity
+common:
+  project_name: ZINC-full
+  trainer_params:
+    max_epochs: 1000
+    testing: true
+    min_lr: 1.0e-06
+    patience_early_stopping: 100
+    gradient_clip_val: 1
+    log_every_n_steps: 100
+    grad_norm_interval: 0
+    track_batch_graph_stats: false
+    track_cuda_memory: false
+  data:
+    dataset_params: {}
+    loader_params:
+      batch_size: 128
+      num_workers: 4
+    dataset: ZINC-full
+    one_hot_edge_features: false
+    one_hot_node_features: false
+  model:
+    model_type: FragGNNSmall
+    classification: false
+    model_params:
+      hidden_channels: 120
+      dropout: 0
+      num_layers: 3
+      num_layers_out: 2
+      inter_message_passing: true
+      higher_message_passing: true
+      ordinal_encoding: false
+      learned_edge_rep: true
+      reduction: sum
+      inter_message_params:
+        reduction: mean
+      frag_reduction: max
+      atom_feature_params:
+        num_atom_types: 30
+        num_atom_features: 1
+      edge_feature_params:
+        num_bond_types: 4
+        num_bond_features: 1
+  optimization:
+    loss: mae
+    scheduler_parameters:
+      cooldown: 5
+      factor: 0.9
+      mode: min
+      patience: 15
+    optimization_params:
+      weight_decay: 0
+      lr: 0.001
+    ema_decay: 0.99
+    train_loss_on_step: false
+    train_loss_on_epoch: true
+variants:
+- name: ringsedbs_overlap
+  manuscript_label: RingsEDBs — Overlap
+  internal_fragmentation: RingsEDBs
+  internal_policy: overlap
+  config:
+    data:
+      fragmentation_method:
+      - RingsEDBs
+      - higher_level_graph_tree
+      - vocab_size: 15
+        higher_edge_policy: overlap
+        use_oov_bucket: false

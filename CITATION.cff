@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, cite both the accompanying study and the original
+  FragNet publication identified in README.md.
+title: FragNet Fragment Connectivity
+type: software
+authors:
+  - family-names: Smith
+    given-names: Max A.
+  - family-names: Yu
+    given-names: Yuncheng
+  - family-names: Liu
+    given-names: Jyh-Charn
+repository-code: https://github.com/maxsmith271346/fragnet-fragment-connectivity
+date-released: 2026-07-25
+preferred-citation:
+  type: article
+  title: >-
+    Context-Dependent Effects of Fragment-Level Connectivity in
+    Substructure-Aware Molecular Graph Neural Networks
+  authors:
+    - family-names: Smith
+      given-names: Max A.
+    - family-names: Yu
+      given-names: Yuncheng
+    - family-names: Liu
+      given-names: Jyh-Charn
+  year: 2026

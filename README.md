@@ -1,53 +1,97 @@
-# FragNet
+# FragNet Fragment Connectivity
 
-Official implementation of ["Expressivity and Generalization: Using Substructure Biases for GNNs"](https://arxiv.org/pdf/2406.08210v1) (ICML 2024).
+This repository contains an independent derivative of the FragNet implementation
+developed by Wollschläger et al. for **“Expressivity and Generalization:
+Fragment-Biases for Molecular GNNs.”**
 
+The code is based on the `view/publication` branch of
+[`KemperNiklas/FragNet`](https://github.com/KemperNiklas/FragNet), at upstream
+commit `3f69708ab7f99db74f7e4b7b704a8293d3da83c4`. It is not an official FragNet release.
 
+This derivative adds the molecular fragmentation schemes and fragment-level
+higher-level graph (HLG) connectivity policies evaluated in:
 
-## Python environment
-First, set up the python environment via
+> **Context-Dependent Effects of Fragment-Level Connectivity in
+> Substructure-Aware Molecular Graph Neural Networks**
+
+## Included extensions
+
+The retained code supports the manuscript's:
+
+- Rings, RingsEDBs, RingsPaths, FGs, RingsFGs, HiFrAMes, BRICS, and
+  no-fragmentation variants;
+- no-HLG-edge, overlap, adjacency, and 2-hop adjacency policies, where
+  applicable;
+- ZINC-full training workflow for penalized logP;
+- lightweight run metadata and logging used for the HPRC experiments.
+
+Manuscript-facing `FGs` and `RingsFGs` correspond to the internal identifiers
+`ErtlEFGs` and `RingsErtlEFGs`, respectively.
+
+## Repository organization
+
+The repository intentionally follows the upstream FragNet layout. It contains
+the runtime code required for the reported model variants, one consolidated
+paper experiment matrix, two readable example configurations, and one TAMU
+HPRC Slurm launcher. Exploratory notebooks, intermediate analysis scripts,
+terminal logs, generated reports, checkpoints, and historical experiment files
+are not included.
+
+## Environment
 
 ```bash
 conda env create -f environment.yml
 conda activate fragNet
 ```
-All experiments are managed with [seml](https://github.com/TUM-DAML/seml). So if you have not used seml before, you have to first set up seml via 
-```bash
-seml configure
-```
-More details can be found in the [seml documentation](https://github.com/TUM-DAML/seml?tab=readme-ov-file#get-started).
 
+## Experiment matrix
 
-## Benchmark results
-
-To recreate the benchmark results, use
+`experiment/ZINC_full_all.yaml` contains the 16 retained model variants and
+seeds 23, 24, and 25, for 48 runs total. It is generated from the historical
+configurations that were present before the publication cleanup.
 
 ```bash
-seml experiment_name_of_your_choice add experiment/xyz.yaml
-seml experiment_name_of_your_choice start
+python run_hprc_experiment.py --config experiment/ZINC_full_all.yaml --list
+python run_hprc_experiment.py --config experiment/ZINC_full_all.yaml --index 0 --print-config
 ```
-where you replace experiment/xyz.yaml with the configuration file for the corresponding dataset.
 
-Note that since writing the paper, we slightly updated/simplified the model. Hence, the results might slightly deviate from the published results. These results can be expected:
+## TAMU HPRC
 
-| Dataset | Result |
-|---- | ---|
-|ZINC-10k | 0.0802 ± 0.0037 (MAE) |
-|ZINC-full | 0.024 (MAE) |
-|peptides-struct| 0.2471 ± 0.0005   (MAE)|
-|peptides-func| 0.6563 ± 0.0060 (AP)|
+The Slurm array uses the same general HPRC execution pattern and resources as
+the original experiments: one GPU, 64 GB memory, four CPU cores, the GPU
+partition, a three-day wall time, and at most four simultaneous jobs.
 
-To get the exact published results, you can switch to the (more cluttered) branch old/view.
+It expects the repository at `$SCRATCH/fragnet-fragment-connectivity` unless
+`FRAGNET_PROJECT_ROOT` is set.
 
+```bash
+sbatch experiment/run_ZINC_full_all.slurm
+```
 
+## Relationship to upstream FragNet
+
+The upstream implementation provides the core fragment-biased molecular GNN
+architecture on which this derivative is based. Users should cite the original
+FragNet work as well as the accompanying fragmentation/connectivity study.
+
+### Original FragNet work
+
+Wollschläger, T.; Kemper, N.; Hetzel, L.; Sommer, J.; Günnemann, S.
+“Expressivity and Generalization: Fragment-Biases for Molecular GNNs.”
+*Proceedings of the 41st International Conference on Machine Learning*,
+PMLR **235**, 53113–53139 (2024).
+
+- Paper: https://proceedings.mlr.press/v235/wollschlager24a.html
+- Upstream code: https://github.com/KemperNiklas/FragNet
+
+### This derivative and accompanying study
+
+Smith, M. A.; Yu, Y.; Liu, J.-C.
+“Context-Dependent Effects of Fragment-Level Connectivity in
+Substructure-Aware Molecular Graph Neural Networks.”
+Publication information will be added when available.
 
 ## Citation
-If you find our work useful, consider citing it.
-```
-@article{fragment_biases,
-  title={Expressivity and Generalization: Fragment-Biases for Molecular GNNs},
-  author={Wollschl{\"a}ger, Tom and Kemper, Niklas and Hetzel, Leon and Sommer, Johanna and G{\"u}nnemann, Stephan},
-  booktitle = {Proceedings of the International Conference on Machine Learning},
-  year={2024}
-}
-```
+
+When using this repository, cite both the original FragNet publication and the
+accompanying study above.

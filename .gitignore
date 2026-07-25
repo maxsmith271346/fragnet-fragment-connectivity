@@ -179,3 +179,21 @@ wandb/
 datasets/data/
 seml_output/
 stuff/
+
+# Publication-repository generated files
+*.out
+*.err
+*.rtf
+*.zip
+*.ckpt
+.ipynb_checkpoints/
+checkpoints/
+experiment/logs/
+experiment/output/
+seml_output/
+wandb/
+*_tree.txt
+analysis_tree.txt
+local_tree.txt
+tree.txt
+comprehensive_*_report*.md

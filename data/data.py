@@ -1,4 +1,6 @@
 import os.path
+import fcntl
+import pathlib
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -19,7 +21,82 @@ from data.graph_to_mol import (  # I have no idea why but this import has to be 
     OGB_Graph_Add_Mol_By_Smiles, ZINC_Graph_Add_Mol)
 from data.lrgb import lrgb
 from data.plogp import FixPlogP, LogP
+import hashlib
+import json
 
+def _sanitize_path_token(x) -> str:
+    return (
+        str(x)
+        .replace(" ", "")
+        .replace("{", "")
+        .replace("}", "")
+        .replace(":", "-")
+        .replace("/", "-")
+    )
+
+
+def _build_config_name(
+    fragmentation_method,
+    encoding,
+    remove_node_features,
+    one_hot_edge_features,
+    one_hot_degree,
+    one_hot_node_features,
+    higher_edge_features,
+    max_raw_len: int = 120,
+) -> str:
+    if fragmentation_method:
+        raw_frag_method_str = "_".join(
+            _sanitize_path_token(x)
+            if not isinstance(x, dict)
+            else "_".join(
+                f"{_sanitize_path_token(k)}-{_sanitize_path_token(v)}"
+                for k, v in x.items()
+            )
+            for x in fragmentation_method
+        )
+    else:
+        raw_frag_method_str = "no_fragmentation"
+
+    raw_name = (
+        f"{raw_frag_method_str}_{encoding}_{remove_node_features}_"
+        f"{one_hot_edge_features}_{one_hot_degree}_{one_hot_node_features}_"
+        f"{higher_edge_features}"
+    )
+    raw_name = _sanitize_path_token(raw_name)
+
+    # Preserve old readable names when they are already short enough.
+    if len(raw_name) <= max_raw_len:
+        return raw_name
+
+    payload = {
+        "fragmentation_method": fragmentation_method,
+        "encoding": encoding,
+        "remove_node_features": remove_node_features,
+        "one_hot_edge_features": one_hot_edge_features,
+        "one_hot_degree": one_hot_degree,
+        "one_hot_node_features": one_hot_node_features,
+        "higher_edge_features": higher_edge_features,
+    }
+    digest = hashlib.sha1(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+
+    frag_tag = (
+        _sanitize_path_token(fragmentation_method[0])
+        if fragmentation_method else "nofrag"
+    )
+    usage_tag = (
+        _sanitize_path_token(fragmentation_method[1])
+        if fragmentation_method and len(fragmentation_method) > 1 else "plain"
+    )
+
+    return f"{frag_tag}_{usage_tag}_{digest}"
 
 def load_fragmentation(dataset,
                        remove_node_features,
@@ -56,13 +133,87 @@ def load_fragmentation(dataset,
 
     if fragmentation_method:
         frag_type, frag_usage, vocab_size_params = fragmentation_method
+        vocab_size_params = vocab_size_params.copy()
+
+        def _coerce_bool(value):
+            if isinstance(value, str):
+                value = value.strip().lower()
+                if value in {"1", "true", "t", "yes", "y", "on"}:
+                    return True
+                if value in {"0", "false", "f", "no", "n", "off", ""}:
+                    return False
+            return bool(value)
+
+        use_oov_bucket = _coerce_bool(vocab_size_params.pop("use_oov_bucket", False))
+        constant_fragment_labels = _coerce_bool(
+            vocab_size_params.pop("constant_fragment_labels", False)
+        )
+        fragment_label_mode = vocab_size_params.pop(
+            "fragment_label_mode",
+            "constant_onehot" if constant_fragment_labels else "default",
+        )
+        fragment_label_mode = str(fragment_label_mode).strip().lower()
+        fragment_label_aliases = {
+            "": "default",
+            "default": "default",
+            "none": "default",
+            "off": "default",
+            "false": "default",
+            "constant": "constant_onehot",
+            "constant_onehot": "constant_onehot",
+            "constant-onehot": "constant_onehot",
+        }
+        if fragment_label_mode not in fragment_label_aliases:
+            raise RuntimeError(
+                "Unsupported fragment_label_mode: "
+                f"{fragment_label_mode!r}. Supported values are 'default' and "
+                "'constant_onehot'."
+            )
+        fragment_label_mode = fragment_label_aliases[fragment_label_mode]
+        constant_fragment_label_id = int(
+            vocab_size_params.pop("constant_fragment_label_id", 0)
+        )
+
+        # Higher-level graph options are consumed here and must not be passed
+        # through to the base fragmenter constructors below.
+        higher_graph_edge_policy = vocab_size_params.pop(
+            "higher_edge_policy",
+            vocab_size_params.pop("edge_policy", "overlap"),
+        )
+        higher_graph_max_distance = int(vocab_size_params.pop(
+            "higher_max_distance",
+            vocab_size_params.pop("max_distance", 2),
+        ))
+
+        # normalize a few aliases for a no-op scheme
+        norm = str(frag_type).strip().lower()
+        is_no_frag = norm in {"no-fragmentation", "none", "noop"}
+
+        if frag_type == "HiFrAMes":
+            vocab_size_params["label_mode"] = frag.normalize_hiframes_label_mode(
+                vocab_size_params.get("label_mode", "family_size")
+            )
+            vocab_size_params["vocab_size"] = frag.infer_hiframes_vocab_size(vocab_size_params)
 
         if frag_usage == "higher_level_graph_tree":
             # later on, tree construction introduces an additional junction fragment
-            vocab_size_params = vocab_size_params.copy()  # allows us to change contents
             vocab_size_params["vocab_size"] -= 1
 
-        vocab = get_vocab(dataset, frag_type, vocab_size_params["vocab_size"])
+        # vocab = get_vocab(dataset, frag_type, vocab_size_params["vocab_size"])
+
+        if is_no_frag:
+            vocab = None
+            # ensure presence and value of vocab_size for downstream modules
+            vocab_size_params["vocab_size"] = 0
+        elif frag_type == "RingsErtlEFGs":
+            max_ring = vocab_size_params.get("max_ring", 15)
+            total_vocab = vocab_size_params["vocab_size"]
+            efg_max = total_vocab - max_ring
+            if efg_max <= 0:
+                raise RuntimeError( f"TOTAL_VOCAB ({total_vocab}) must be > MAX_RING ({max_ring}).")
+            vocab = get_vocab(dataset, frag_type, efg_max)
+        else:
+            vocab = get_vocab(dataset, frag_type, vocab_size_params["vocab_size"])
 
         frag_constructions = {
             "BBB": frag.BreakingBridgeBonds,
@@ -72,7 +223,14 @@ def load_fragmentation(dataset,
             "Rings": frag.Rings,
             "RingsEdges": frag.RingsEdges,
             "RingsPaths": frag.RingsPaths,
-            "MagnetWithoutVocab": frag.MagnetWithoutVocab
+            "RingsEDBs": frag.RingsEDBs,
+            "MagnetWithoutVocab": frag.MagnetWithoutVocab,
+            "ErtlEFGs": frag.ErtlEFGs,
+            "RingsErtlEFGs": frag.RingsErtlEFGs,
+            "HiFrAMes": frag.HiFrAMes,
+            "no-fragmentation": frag.NoFragmentation,
+            "none": frag.NoFragmentation,
+            "noop": frag.NoFragmentation,
         }
         frag_usages = {
             "node_feature":
@@ -82,13 +240,21 @@ def load_fragmentation(dataset,
             "fragment":
             frag.FragmentRepresentation(vocab_size_params["vocab_size"]),
             "higher_level_graph_tree":
-            frag.HigherLevelGraph(vocab_size_params["vocab_size"],
-                                  "tree",
-                                  higher_edge_features=higher_edge_features),
+            frag.HigherLevelGraph(
+                vocab_size=vocab_size_params["vocab_size"],
+                edge_policy=higher_graph_edge_policy,
+                mode="tree",
+                higher_edge_features=higher_edge_features,
+                max_distance=higher_graph_max_distance,
+            ),
             "higher_level_graph_node":
-            frag.HigherLevelGraph(vocab_size_params["vocab_size"],
-                                  "node",
-                                  higher_edge_features=higher_edge_features)
+            frag.HigherLevelGraph(
+                vocab_size=vocab_size_params["vocab_size"],
+                edge_policy=higher_graph_edge_policy,
+                mode="node",
+                higher_edge_features=higher_edge_features,
+                max_distance=higher_graph_max_distance,
+            )
         }
 
     # create fragmentation
@@ -111,12 +277,50 @@ def load_fragmentation(dataset,
         transformations.append(OneHotDegree(100))
 
     if fragmentation_method:
-        frag_construction = frag_constructions[frag_type](
-            vocab) if vocab else frag_constructions[frag_type](
-                **vocab_size_params)
+        if is_no_frag:
+            # create empty substructures; downstream usage stages will make empty tensors
+            frag_construction = frag.NoFragmentation()
+        elif frag_type == "RingsErtlEFGs":
+            max_ring = vocab_size_params.get("max_ring", 15)
+            frag_construction = frag.RingsErtlEFGs(
+                vocab,
+                max_ring=max_ring,
+                use_oov_bucket=use_oov_bucket,
+            )
+        elif frag_type in {"BRICS", "ErtlEFGs"}:
+            frag_construction = frag_constructions[frag_type](
+                vocab,
+                use_oov_bucket=use_oov_bucket,
+            )
+        else:
+            frag_construction = (
+                frag_constructions[frag_type](vocab)
+                if vocab else frag_constructions[frag_type](**vocab_size_params)
+            )
+
         frag_representation = frag_usages[frag_usage]
         transformations.append(frag_construction)
         transformations.append(frag_representation)
+
+        if fragment_label_mode == "constant_onehot":
+            if frag_usage not in {"fragment", "higher_level_graph_tree", "higher_level_graph_node"}:
+                raise RuntimeError(
+                    "fragment_label_mode='constant_onehot' requires a fragment "
+                    "representation usage ('fragment', 'higher_level_graph_tree', "
+                    "or 'higher_level_graph_node')."
+                )
+            transformations.append(
+                frag.ConstantOneHotFragmentLabels(
+                    constant_id=constant_fragment_label_id,
+                )
+            )
+
+        if is_no_frag and frag_usage:
+            transformations.append(
+                frag.EnsureFragmentPlaceholders(
+                    vocab_size=vocab_size_params.get("vocab_size", 0)
+                )
+            )
 
     if encoding:
         for encod in encoding:
@@ -127,73 +331,165 @@ def load_fragmentation(dataset,
             else:
                 raise RuntimeError(f"Encoding {encod['name']} not supported.")
 
-    config_name = f"{str(fragmentation_method)}_{str(encoding)}_{str(remove_node_features)}_{str(one_hot_edge_features)}_{str(one_hot_degree)}_{str(one_hot_node_features)}_{str(higher_edge_features)}"
+    # turn fragmentation method into a valid filename ()
+    config_name = _build_config_name(
+        fragmentation_method=fragmentation_method,
+        encoding=encoding,
+        remove_node_features=remove_node_features,
+        one_hot_edge_features=one_hot_edge_features,
+        one_hot_degree=one_hot_degree,
+        one_hot_node_features=one_hot_node_features,
+        higher_edge_features=higher_edge_features,
+    )
+    
+    # symlink generation to raw data for any raw dataset
+    root = f'{DATASET_ROOT}/{dataset}/{dataset}_{config_name}'
+    raw_link = os.path.join(root, "raw")
+    real_raw = os.path.abspath(
+        os.path.join(DATASET_ROOT, dataset, f"{dataset}_mol", "raw")
+    )
 
-    if dataset == "ZINC" or dataset == "ZINC-full":
-        transformations.insert(0, ZINC_Graph_Add_Mol())
-        transform = Compose(transformations)
-        subset = True if dataset == "ZINC" else False
-        train_data = ZINC(
-            root=f'{DATASET_ROOT}/{dataset}/{dataset}_{config_name}',
-            pre_transform=transform,
-            subset=subset,
-            split="train")
-        val_data = ZINC(
-            root=f'{DATASET_ROOT}/{dataset}/{dataset}_{config_name}',
-            pre_transform=transform,
-            subset=subset,
-            split="val")
-        test_data = ZINC(
-            root=f'{DATASET_ROOT}/{dataset}/{dataset}_{config_name}',
-            pre_transform=transform,
-            subset=subset,
-            split="test")
-        data = train_data
-        num_classes = 1
+    zinc_like_datasets = {
+        "ZINC",
+        "ZINC-full",
+        "ZINC-fixed",
+        "ZINC-full-fixed",
+        "ZINC-logP",
+        "ZINC-full-logP",
+        "ZINC-count",
+    }
 
-    elif dataset == "ZINC-fixed" or dataset == "ZINC-full-fixed":
-        transformations.insert(0, ZINC_Graph_Add_Mol())
-        transformations.append(FixPlogP())
-        transform = Compose(transformations)
-        subset = True if dataset == "ZINC-fixed" else False
-        train_data = ZINC(root=f'{DATASET_ROOT}/{dataset}/{dataset}_{config_name}',
-                          pre_transform=transform, subset=subset, split="train")
-        val_data = ZINC(root=f'{DATASET_ROOT}/{dataset}/{dataset}_{config_name}',
-                        pre_transform=transform, subset=subset, split="val")
-        test_data = ZINC(root=f'{DATASET_ROOT}/{dataset}/{dataset}_{config_name}',
-                         pre_transform=transform, subset=subset, split="test")
-        data = train_data
-        num_classes = 1
+    if dataset in zinc_like_datasets:
+        pathlib.Path(root).mkdir(parents=True, exist_ok=True)
 
-    elif dataset == "ZINC-logP" or dataset == "ZINC-full-logP":
-        transformations.insert(0, ZINC_Graph_Add_Mol())
-        transformations.append(LogP())
-        transform = Compose(transformations)
-        subset = True if dataset == "ZINC-logP" else False
-        train_data = ZINC(root=f'{DATASET_ROOT}/{dataset}/{dataset}_{config_name}',
-                          pre_transform=transform, subset=subset, split="train")
-        val_data = ZINC(root=f'{DATASET_ROOT}/{dataset}/{dataset}_{config_name}',
-                        pre_transform=transform, subset=subset, split="val")
-        test_data = ZINC(root=f'{DATASET_ROOT}/{dataset}/{dataset}_{config_name}',
-                         pre_transform=transform, subset=subset, split="test")
-        data = train_data
-        num_classes = 1
+        lock_path = os.path.join(root, ".process.lock")
+        with open(lock_path, "w") as lockf:
+            fcntl.flock(lockf, fcntl.LOCK_EX)
 
-    elif dataset == "ZINC-count":
-        transformations.insert(0, ZINC_Graph_Add_Mol())
-        substructure_idx = kwargs["substructure_idx"] if "substructure_idx" in kwargs else None
-        transformations.insert(1, CountSubstructures(
-            substructure_idx=substructure_idx))
-        transform = Compose(transformations)
-        subset = True
-        train_data = ZINC(root=f'{DATASET_ROOT}/{dataset}/{dataset}_{config_name}_{substructure_idx}',
-                          pre_transform=transform, subset=subset, split="train")
-        val_data = ZINC(root=f'{DATASET_ROOT}/{dataset}/{dataset}_{config_name}_{substructure_idx}',
-                        pre_transform=transform, subset=subset, split="val")
-        test_data = ZINC(root=f'{DATASET_ROOT}/{dataset}/{dataset}_{config_name}_{substructure_idx}',
-                         pre_transform=transform, subset=subset, split="test")
-        data = train_data
-        num_classes = 15 if substructure_idx is None else 1
+            try:
+                os.symlink(real_raw, raw_link)
+            except FileExistsError:
+                if not os.path.islink(raw_link):
+                    raise RuntimeError(f"{raw_link} exists but is not a symlink")
+                if os.path.realpath(raw_link) != os.path.realpath(real_raw):
+                    raise RuntimeError(
+                        f"{raw_link} points to {os.path.realpath(raw_link)} "
+                        f"instead of {os.path.realpath(real_raw)}"
+                    )
+
+            if dataset == "ZINC" or dataset == "ZINC-full":
+                transformations.insert(0, ZINC_Graph_Add_Mol())
+                transform = Compose(transformations)
+                subset = True if dataset == "ZINC" else False
+                train_data = ZINC(
+                    root=root,
+                    pre_transform=transform,
+                    subset=subset,
+                    split="train")
+                val_data = ZINC(
+                    root=root,
+                    pre_transform=transform,
+                    subset=subset,
+                    split="val")
+                test_data = ZINC(
+                    root=root,
+                    pre_transform=transform,
+                    subset=subset,
+                    split="test")
+                data = train_data
+                num_classes = 1
+
+            elif dataset == "ZINC-fixed" or dataset == "ZINC-full-fixed":
+                transformations.insert(0, ZINC_Graph_Add_Mol())
+                transformations.append(FixPlogP())
+                transform = Compose(transformations)
+                subset = True if dataset == "ZINC-fixed" else False
+                train_data = ZINC(
+                    root=root,
+                    pre_transform=transform,
+                    subset=subset,
+                    split="train")
+                val_data = ZINC(
+                    root=root,
+                    pre_transform=transform,
+                    subset=subset,
+                    split="val")
+                test_data = ZINC(
+                    root=root,
+                    pre_transform=transform,
+                    subset=subset,
+                    split="test")
+                data = train_data
+                num_classes = 1
+
+            elif dataset == "ZINC-logP" or dataset == "ZINC-full-logP":
+                transformations.insert(0, ZINC_Graph_Add_Mol())
+                transformations.append(LogP())
+                transform = Compose(transformations)
+                subset = True if dataset == "ZINC-logP" else False
+                train_data = ZINC(
+                    root=root,
+                    pre_transform=transform,
+                    subset=subset,
+                    split="train")
+                val_data = ZINC(
+                    root=root,
+                    pre_transform=transform,
+                    subset=subset,
+                    split="val")
+                test_data = ZINC(
+                    root=root,
+                    pre_transform=transform,
+                    subset=subset,
+                    split="test")
+                data = train_data
+                num_classes = 1
+
+            elif dataset == "ZINC-count":
+                transformations.insert(0, ZINC_Graph_Add_Mol())
+                substructure_idx = kwargs["substructure_idx"] if "substructure_idx" in kwargs else None
+                transformations.insert(1, CountSubstructures(
+                    substructure_idx=substructure_idx))
+                transform = Compose(transformations)
+                subset = True
+                count_root = f"{root}_{substructure_idx}"
+
+                pathlib.Path(count_root).mkdir(parents=True, exist_ok=True)
+                count_raw_link = os.path.join(count_root, "raw")
+                count_lock_path = os.path.join(count_root, ".process.lock")
+
+                with open(count_lock_path, "w") as count_lockf:
+                    fcntl.flock(count_lockf, fcntl.LOCK_EX)
+
+                    try:
+                        os.symlink(real_raw, count_raw_link)
+                    except FileExistsError:
+                        if not os.path.islink(count_raw_link):
+                            raise RuntimeError(f"{count_raw_link} exists but is not a symlink")
+                        if os.path.realpath(count_raw_link) != os.path.realpath(real_raw):
+                            raise RuntimeError(
+                                f"{count_raw_link} points to {os.path.realpath(count_raw_link)} "
+                                f"instead of {os.path.realpath(real_raw)}"
+                            )
+
+                    train_data = ZINC(
+                        root=count_root,
+                        pre_transform=transform,
+                        subset=subset,
+                        split="train")
+                    val_data = ZINC(
+                        root=count_root,
+                        pre_transform=transform,
+                        subset=subset,
+                        split="val")
+                    test_data = ZINC(
+                        root=count_root,
+                        pre_transform=transform,
+                        subset=subset,
+                        split="test")
+
+                data = train_data
+                num_classes = 15 if substructure_idx is None else 1
 
     elif dataset == "ogbg-molhiv":
         transformations.insert(0, OGB_Graph_Add_Mol_By_Smiles())
@@ -295,7 +591,7 @@ def get_vocab(dataset: str,
         root (str, optional): The root directory for storing the vocabulary. Defaults to VOCAB_ROOT.
 
     Returns:
-        vocab: The vocabulary for the given dataset and fragmentation type, if the fragmentation scheme requires no vocabulary 
+        vocab: The vocabulary for the given dataset and fragmentation type, if the fragmentation scheme requires no vocabulary
         (e.g. RingsPaths fragmentation) None is returned.
     """
 
@@ -309,7 +605,14 @@ def get_vocab(dataset: str,
         "Rings": None,
         "RingsEdges": None,
         "RingsPaths": None,
-        "MagnetWithoutVocab": None
+        "RingsEDBs": None,
+        "MagnetWithoutVocab": None,
+        "ErtlEFGs": frag.ErtlEFGVocab(vocab_size=max_vocab),
+        "RingsErtlEFGs": frag.ErtlEFGVocab(vocab_size=max_vocab),
+        "HiFrAMes": None,
+        "no-fragmentation": None,
+        "none": None,
+        "noop": None,
     }
 
     if frag_type not in vocab_constructions:
@@ -322,12 +625,15 @@ def get_vocab(dataset: str,
             vocab = frag.get_vocab_from_file(vocab_file_name)
         else:
             # create vocab
-            if dataset == "ZINC" or dataset == "ZINC-full":
-                subset = True if dataset == "ZINC" else False
-                vocab_data = ZINC(root=f'{DATASET_ROOT}/{dataset}/{dataset}_mol',
-                                  pre_transform=ZINC_Graph_Add_Mol(),
-                                  subset=subset,
-                                  split="train")
+            if dataset in ["ZINC", "ZINC-full",
+               "ZINC-fixed", "ZINC-full-fixed", "ZINC-logP", "ZINC-full-logP"]:
+                subset = "full" not in dataset  # subsets are for datasets without "full"
+                vocab_data = ZINC(
+                    root=f'{DATASET_ROOT}/{dataset}/{dataset}_mol',
+                    pre_transform=ZINC_Graph_Add_Mol(),
+                    subset=subset,
+                    split="train"
+                )
             elif dataset == "ogbg-molhiv":
                 vocab_data = PygGraphPropPredDataset(
                     name=dataset,
