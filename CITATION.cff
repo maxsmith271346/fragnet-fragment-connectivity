@@ -13,6 +13,8 @@ authors:
     given-names: Jyh-Charn
 repository-code: https://github.com/maxsmith271346/fragnet-fragment-connectivity
 date-released: 2026-07-25
+version: 1.0.0
+doi: 10.5281/zenodo.1234567
 preferred-citation:
   type: article
   title: >-

@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/1312239746.svg)](https://doi.org/10.5281/zenodo.21574227)
+
 # FragNet Fragment Connectivity
 
 This repository contains an independent derivative of the FragNet implementation
