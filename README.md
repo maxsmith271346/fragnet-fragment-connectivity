@@ -1,4 +1,4 @@
-[![DOI](https://zenodo.org)](https://doi.org/10.5281/zenodo.21574227)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo-blue.svg))](https://doi.org/10.5281/zenodo.21574227)
 
 # FragNet Fragment Connectivity
 
